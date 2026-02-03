@@ -21,6 +21,7 @@
 2. **반드시 별도 테스트서버에서 실행하여 이전 결과를 확인한 후에 실제 적용하세요. 데이터 손상은 본인 책임입니다.**
 3. `config.php`에서 `$src_config`와 `$gn_config`에 올바른 접속 정보를 입력합니다.
 4. 프로젝트 루트(또는 migration 디렉토리)에서 스크립트를 실행합니다. 변경을 가하지 않고 동작을 확인하려면 `--dry-run`을 사용하고 로그를 남기려면 `--log=파일`을 지정하세요.
+5. 콘솔 출력(또는 로그 파일)을 확인하여 생성된 보드, 게시물, 회원 및 경고 사항을 검토하세요.
 
 ```bash
 # 실제 실행 (대상 DB에 쓰기)
@@ -32,8 +33,6 @@ php migrate2gb.php --dry-run
 # Dry-run 및 로그 파일 기록
 php migrate2gb.php --dry-run --log=migration.log
 ```
-
-4. 콘솔 출력(또는 로그 파일)을 확인하여 생성된 보드, 게시물, 회원 및 경고 사항을 검토하세요.
 
 ---
 
@@ -47,6 +46,7 @@ php migrate2gb.php --dry-run --log=migration.log
 - `--members-sample=P` — 무작위 샘플로 P%만 이전합니다(대표성 있는 테스트에 유용).
 
 예시:
+
 ```bash
 # 처음 500명만 dry-run으로 테스트 (100개 단위로 처리)
 php migrate2gb.php --dry-run --max-members=500 --member-batch-size=100 --log=migration.log
@@ -59,7 +59,7 @@ php migrate2gb.php --dry-run --members=12,34,56 --log=migration.log
 
 ---
 
-## 안전성 및 제약 사항 ⚠️
+## 안전성 및 제약 사항
 
 - 스크립트는 커스텀 필드, 권한 설정, 고급 모듈 구성 등을 완벽하게 변환하지 않습니다.
 - 회원 비밀번호는 재설정됩니다: `mb_password`에 랜덤 비밀번호가 들어가고 원본 해시는 `mb_memo`에 보관됩니다. 사용자에게 비밀번호 재설정을 안내해야 합니다.
@@ -69,7 +69,7 @@ php migrate2gb.php --dry-run --members=12,34,56 --log=migration.log
 
 ---
 
-## 문제 해결 팁 💡
+## 문제 해결 팁
 
 - `rhymix_modules` 또는 `xe_modules`가 없다는 메시지가 나오면 `config.php`의 접속 정보와 소스 DB 구조를 확인하세요.
 - 스키마 차이로 인서트가 실패하면 (`NOT NULL` 컬럼, 길이 제한 등) 로그를 확인하고 스크립트의 필드 매핑이나 대상 DB 스키마를 조정하세요.
