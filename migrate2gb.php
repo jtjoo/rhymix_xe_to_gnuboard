@@ -418,6 +418,8 @@ foreach ($modules as $m) {
     $cnt_stmt = $src_db->prepare("SELECT COUNT(*) FROM {$prefix}documents WHERE module_srl = ?");
     $cnt_stmt->execute([$module_srl]);
     $doc_total = (int)$cnt_stmt->fetchColumn();
+    // close cursor to allow subsequent unbuffered queries on the same connection
+    if (method_exists($cnt_stmt, 'closeCursor')) $cnt_stmt->closeCursor();
     log_msg("  -> 문서 수: {$doc_total} (streaming)\n");
 
     $docs_stmt = $src_db->prepare("SELECT * FROM {$prefix}documents WHERE module_srl = ? ORDER BY regdate ASC");
@@ -492,6 +494,7 @@ foreach ($modules as $m) {
         if (function_exists('gc_collect_cycles')) gc_collect_cycles();
     }
 
+    if (method_exists($docs_stmt, 'closeCursor')) $docs_stmt->closeCursor();
     log_msg("  -> 처리 완료: {$processed} / {$doc_total}\n");
 
     // 5) 메뉴 항목 추가 (간단 매핑)
