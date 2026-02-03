@@ -23,21 +23,36 @@ try {
     die("DB 연결 오류: " . $e->getMessage() . "\n");
 }
 
-// 테이블 접두사 감지 (rhymix_ 우선, 없으면 xe_ 사용)
+// 테이블 접두사 감지 (자동화)
+// - rhymix_/xe_ 외에도 어떤 접두사든 *_modules를 찾아 자동으로 사용합니다.
 $prefix = null;
 try {
-    $r = $src_db->query("SHOW TABLES LIKE 'rhymix_modules'")->fetch(PDO::FETCH_NUM);
-    if ($r) $prefix = 'rhymix_';
-    else {
-        $r2 = $src_db->query("SHOW TABLES LIKE 'xe_modules'")->fetch(PDO::FETCH_NUM);
-        if ($r2) $prefix = 'xe_';
+    $tables = $src_db->query("SHOW TABLES")->fetchAll(PDO::FETCH_COLUMN);
+    $candidates = [];
+    foreach ($tables as $t) {
+        if (preg_match('/^(.+)_modules$/', $t, $m)) {
+            $candidate = $m[1] . '_';
+            // documents와 member 테이블이 함께 있는 접두사를 우선시
+            if (in_array($m[1] . '_documents', $tables) && in_array($m[1] . '_member', $tables)) {
+                $prefix = $candidate;
+                break;
+            }
+            $candidates[] = $candidate;
+        }
+    }
+
+    // 알려진 이름 우선, 그 다음 후보 목록에서 선택
+    if (!$prefix) {
+        if (in_array('rhymix_modules', $tables)) $prefix = 'rhymix_';
+        elseif (in_array('xe_modules', $tables)) $prefix = 'xe_';
+        elseif (!empty($candidates)) $prefix = $candidates[0];
     }
 } catch (Exception $e) {
     // 무시, 아래에서 체크
 }
 
 if (!$prefix) {
-    die("Rhymix 또는 XE의 모듈 테이블을 찾을 수 없습니다. (rhymix_modules 또는 xe_modules 필요)\n");
+    die("원본 DB에서 모듈 테이블 접두사를 자동으로 찾을 수 없습니다. (예: rhymix_modules 또는 xe_modules)\n");
 }
 
 echo "=== {$prefix} -> GNUBoard 마이그레이션 시작 ===\n";
@@ -85,6 +100,13 @@ function ensure_write_table($gn_db, $bo_table) {
     echo "+ 생성: {$tbl}\n";
 }
 
+// 유틸리티: 테이블에서 NOT NULL이고 DEFAULT가 없는 컬럼 목록을 반환
+function get_required_columns($gn_db, $table) {
+    $stmt = $gn_db->prepare("SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND IS_NULLABLE = 'NO' AND COLUMN_DEFAULT IS NULL");
+    $stmt->execute([$table]);
+    return $stmt->fetchAll(PDO::FETCH_ASSOC);
+}
+
 // 1) 모듈(게시판) 목록 읽기
 $modules = $src_db->query("SELECT * FROM {$prefix}modules WHERE module = 'board'")->fetchAll(PDO::FETCH_ASSOC);
 if (!$modules) {
@@ -107,8 +129,53 @@ foreach ($modules as $m) {
     $exists = $gn_db->prepare("SELECT bo_table FROM g5_board WHERE bo_table = ?");
     $exists->execute([$bo_table]);
     if (!$exists->fetch()) {
-        $insert = $gn_db->prepare("INSERT INTO g5_board (bo_table, bo_subject, bo_content_head, bo_page_rows, bo_mobile_page_rows, bo_skin) VALUES (?, ?, ?, ?, ?, ?)");
-        $insert->execute([$bo_table, $title, '', 20, 15, 'basic']);
+        // 필요한 NOT NULL 컬럼을 찾아 기본값으로 채웁니다.
+        $required = get_required_columns($gn_db, 'g5_board');
+
+        // 보장을 위해 항상 포함할 컬럼
+        $always = ['bo_table', 'bo_subject'];
+        $req_names = array_column($required, 'COLUMN_NAME');
+        foreach ($always as $a) {
+            if (!in_array($a, $req_names)) {
+                // 데이터 타입을 기본으로 추가
+                $required[] = ['COLUMN_NAME' => $a, 'DATA_TYPE' => 'varchar'];
+            }
+        }
+
+        $colNames = [];
+        $placeholders = [];
+        $values = [];
+
+        // 자주 사용되는 기본값 맵
+        $defaults = [
+            'bo_table' => $bo_table,
+            'bo_subject' => $title,
+            'bo_content_head' => '',
+            'bo_page_rows' => 20,
+            'bo_mobile_page_rows' => 15,
+            'bo_skin' => 'basic',
+            'bo_category_list' => '',
+            'bo_use_category' => 0
+        ];
+
+        foreach ($required as $c) {
+            $name = $c['COLUMN_NAME'];
+            $dtype = strtolower($c['DATA_TYPE']);
+            if (isset($defaults[$name])) {
+                $val = $defaults[$name];
+            } else {
+                // 정수형은 0, 문자형은 빈 문자열로 기본값 설정
+                if (in_array($dtype, ['tinyint','smallint','mediumint','int','bigint'])) $val = 0;
+                else $val = '';
+            }
+            $colNames[] = "`$name`";
+            $placeholders[] = '?';
+            $values[] = $val;
+        }
+
+        $sql = "INSERT INTO g5_board (" . implode(',', $colNames) . ") VALUES (" . implode(',', $placeholders) . ")";
+        $ins = $gn_db->prepare($sql);
+        $ins->execute($values);
         echo "+ 보드 생성: {$bo_table} ({$title})\n";
     } else {
         echo "- 보드 이미 존재: {$bo_table} ({$title})\n";
@@ -130,7 +197,7 @@ foreach ($modules as $m) {
 
         $ins = $gn_db->prepare("INSERT INTO g5_write_{$bo_table} 
             (wr_num, wr_reply, wr_parent, wr_is_comment, wr_comment, wr_subject, wr_content, wr_hit, wr_name, wr_datetime, wr_ip, mb_id)
-            VALUES (?, '', 0, 0, 0, ?, ?, ?, ?, ?, ?)");
+            VALUES (?, '', 0, 0, 0, ?, ?, ?, ?, ?, ?, ?)");
 
         $content = isset($doc['content']) ? $doc['content'] : '';
         $content = str_replace('/storage/app/public/', '/data/file/' . $bo_table . '/', $content);
