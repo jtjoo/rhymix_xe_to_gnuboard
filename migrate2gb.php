@@ -16,23 +16,139 @@
 
 include "config.php";
 
+// -----------------------------
+// CLI options and logging
+// -----------------------------
+$dryRun = false;        // --dry-run : do not perform any writes
+$logFile = null;        // --log=path : append log to file
+$batchSize = 100;      // --batch-size=N : number of docs per DB batch (to limit memory)
+
+// Parse command line arguments (supports php migrate2gb.php --dry-run --log=path --batch-size=N)
+if (php_sapi_name() === 'cli') {
+    global $argv;
+    foreach (array_slice($argv, 1) as $arg) {
+        if ($arg === '--dry-run' || $arg === '-n') $dryRun = true;
+        elseif (strpos($arg, '--log=') === 0) $logFile = substr($arg, 6);
+        elseif (strpos($arg, '--batch-size=') === 0) $batchSize = (int)substr($arg, 13);
+        elseif ($arg === '--help' || $arg === '-h') {
+            echo "Usage: php migrate2gb.php [--dry-run] [--log=FILE] [--batch-size=N]\n";
+            echo "  --dry-run, -n        : show what would be done without writing to DB\n";
+            echo "  --log=FILE           : append logs to FILE\n";
+            echo "  --batch-size=N       : number of documents to fetch per batch (default 100)\n";
+            exit(0);
+        }
+    }
+
+    // Normalize log file path (make absolute relative to current working directory)
+    if ($logFile) {
+        if ($logFile[0] !== '/') {
+            $logFile = getcwd() . DIRECTORY_SEPARATOR . $logFile;
+        }
+        $logDir = dirname($logFile);
+        if (!is_dir($logDir)) {
+            // try to create directory if missing
+            @mkdir($logDir, 0775, true);
+        }
+        // create or touch the log file
+        $ok = @file_put_contents($logFile, "", FILE_APPEND);
+        if ($ok === false || !is_writable($logFile)) {
+            // warn the user that the log path may not be writable in this environment
+            echo "경고: 로그 파일을 생성하거나 쓸 수 없습니다: {$logFile}\n";
+        }
+    }
+
+    // 메모리 최적화: 실행 환경의 memory_limit이 낮으면 자동으로 상향을 시도합니다.
+    // 기본 목표는 512M, 필요 시 환경변수 MIGRATE_MEMORY로 조정 가능합니다.
+    $targetMemory = getenv('MIGRATE_MEMORY') ?: '512M';
+    function memory_to_bytes($v) {
+        $v = trim($v);
+        $last = strtolower($v[strlen($v)-1]);
+        $num = (int)$v;
+        switch($last) {
+            case 'g': $num *= 1024; // fallthrough
+            case 'm': $num *= 1024; // fallthrough
+            case 'k': $num *= 1024;
+        }
+        return $num;
+    }
+    $current = ini_get('memory_limit');
+    try {
+        if (memory_to_bytes($current) < memory_to_bytes($targetMemory)) {
+            ini_set('memory_limit', $targetMemory);
+            log_msg("메모리 제한 상향 시도: {$current} -> {$targetMemory}\n");
+        }
+    } catch (Exception $e) {
+        log_msg("메모리 제한 변경 시도 중 오류: " . $e->getMessage() . "\n");
+    }
+}
+
+/**
+ * log_msg
+ * - Unified logging function. In dry-run mode it prefixes messages and still writes to log file if provided.
+ */
+function log_msg($msg) {
+    global $dryRun, $logFile;
+    $prefix = $dryRun ? 'DRY RUN: ' : '';
+    echo $prefix . $msg;
+    if ($logFile) {
+        // ensure newline at end
+        file_put_contents($logFile, $prefix . $msg, FILE_APPEND);
+    }
+}
+
+/**
+ * run_exec
+ * - Wrapper for $db->exec that respects dry-run.
+ */
+function run_exec($db, $sql, $desc = '') {
+    global $dryRun;
+    if ($dryRun) {
+        log_msg("Would exec: {$desc} -- SQL: " . (strlen($sql) > 200 ? substr($sql, 0, 200) . '...' : $sql) . "\n");
+        return true;
+    }
+    return $db->exec($sql);
+}
+
+/**
+ * run_stmt
+ * - Wrapper for prepared statements' execute that respects dry-run.
+ */
+function run_stmt($stmt, $params = [], $desc = '') {
+    global $dryRun;
+    if ($dryRun) {
+        log_msg("Would execute prepared: {$desc} -- params: " . json_encode($params) . "\n");
+        return true;
+    }
+    return $stmt->execute($params);
+}
+
 try {
     // 데이터베이스 연결
     // `$src_db`는 Rhymix/XE 원본 DB, `$gn_db`는 GNUBoard 대상 DB입니다.
     // 연결 정보는 `config.php`에서 불러옵니다.
+    // src_db는 큰 결과셋을 스트리밍 처리하기 위해 비버퍼드 쿼리를 사용합니다.
+    // (PDO::MYSQL_ATTR_USE_BUFFERED_QUERY = false)
+    $src_opts = [
+        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+        PDO::MYSQL_ATTR_USE_BUFFERED_QUERY => false
+    ];
     $src_db = new PDO(
         "mysql:host={$src_config['server']};dbname={$src_config['database']}",
         $src_config['username'],
-        $src_config['password']
+        $src_config['password'],
+        $src_opts
     );
+
+    // gn_db can remain default-buffered for convenience
     $gn_db = new PDO(
         "mysql:host={$gn_config['server']};dbname={$gn_config['database']}",
         $gn_config['username'],
         $gn_config['password']
     );
     // 에러는 예외로 처리하도록 설정해 명확한 실패 원인을 제공합니다.
-    $src_db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
     $gn_db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+    // src_db already set ERRMODE via options above
+
 } catch (Exception $e) {
     // 치명적 오류: 연결 실패는 더 이상 진행할 이유가 없으므로 종료합니다.
     die("DB 연결 오류: " . $e->getMessage() . "\n");
@@ -75,7 +191,7 @@ if (!$prefix) {
     die("원본 DB에서 모듈 테이블 접두사를 자동으로 찾을 수 없습니다. (예: rhymix_modules 또는 xe_modules)\n");
 }
 
-echo "=== {$prefix} -> GNUBoard 마이그레이션 시작 ===\n";
+log_msg("=== {$prefix} -> GNUBoard 마이그레이션 시작 ===\n");
 
 // ---------------------
 // 유틸리티 함수들
@@ -99,8 +215,23 @@ function sanitize_bo_table($s) {
  * - 이렇게 하면 기존의 wr_num과 충돌하지 않습니다.
  */
 function get_next_wr_num($table, $db) {
-    $row = $db->query("SELECT min(wr_num) as min_num FROM g5_write_{$table}")->fetch(PDO::FETCH_ASSOC);
-    return (int)$row['min_num'] - 1;
+    // 안전성 강화: g5_write_{table}가 없으면 생성 시도 후 기본 wr_num 반환
+    try {
+        $row = $db->query("SELECT min(wr_num) as min_num FROM g5_write_{$table}")->fetch(PDO::FETCH_ASSOC);
+        return (int)$row['min_num'] - 1;
+    } catch (PDOException $e) {
+        // 테이블이 존재하지 않아 발생하는 오류일 가능성 있음
+        $msg = $e->getMessage();
+        if (stripos($msg, 'doesn\'t exist') !== false || stripos($msg, 'no such table') !== false || stripos($msg, 'Base table or view not found') !== false) {
+            // ensure_write_table를 호출하여 안전하게 테이블을 생성
+            log_msg("경고: g5_write_{$table} 테이블을 찾을 수 없어 생성 시도합니다.\n");
+            ensure_write_table($db, $table);
+            // 테이블이 비어있으므로 예약할 wr_num은 -1
+            return -1;
+        }
+        // 다른 예외는 그대로 던집니다.
+        throw $e;
+    }
 }
 
 /**
@@ -134,8 +265,8 @@ function ensure_write_table($gn_db, $bo_table) {
         `mb_id` varchar(20) NOT NULL DEFAULT '',
         PRIMARY KEY (`wr_id`)
     ) ENGINE=MyISAM DEFAULT CHARSET=utf8;";
-    $gn_db->exec($sql);
-    echo "+ 생성: {$tbl}\n";
+    run_exec($gn_db, $sql, "create table {$tbl}");
+    log_msg("+ 생성: {$tbl}\n");
 }
 
 // 유틸리티: 테이블에서 NOT NULL이고 DEFAULT가 없는 컬럼 목록을 반환
@@ -165,10 +296,10 @@ function ensure_column_is_mediumtext($gn_db, $table, $column) {
     if (!in_array($dtype, ['text', 'mediumtext', 'longtext'])) {
         try {
             // 가능한 경우 MEDIUMTEXT로 확장
-            $gn_db->exec("ALTER TABLE `" . $table . "` MODIFY `" . $column . "` MEDIUMTEXT NOT NULL");
-            echo "+ 컬럼 변경: {$table}.{$column} -> MEDIUMTEXT\n";
+            run_exec($gn_db, "ALTER TABLE `" . $table . "` MODIFY `" . $column . "` MEDIUMTEXT NOT NULL", "alter {$table}.{$column} to MEDIUMTEXT");
+            log_msg("+ 컬럼 변경: {$table}.{$column} -> MEDIUMTEXT\n");
         } catch (Exception $e) {
-            echo "경고: {$table}.{$column} 타입 변경 실패: " . $e->getMessage() . "\n";
+            log_msg("경고: {$table}.{$column} 타입 변경 실패: " . $e->getMessage() . "\n");
         }
     }
 }
@@ -191,11 +322,11 @@ function get_column_max_chars($info) {
 // 1) 모듈(게시판) 목록 읽기
 $modules = $src_db->query("SELECT * FROM {$prefix}modules WHERE module = 'board'")->fetchAll(PDO::FETCH_ASSOC);
 if (!$modules) {
-    echo "원본 DB에서 게시판 모듈을 찾지 못했습니다. ({$prefix}modules 테이블 확인)\n";
+    log_msg("원본 DB에서 게시판 모듈을 찾지 못했습니다. ({$prefix}modules 테이블 확인)\n");
     exit;
 }
 
-echo "발견된 게시판 수: " . count($modules) . "\n";
+log_msg("발견된 게시판 수: " . count($modules) . "\n");
 
 $menu_order = 1;
 
@@ -259,10 +390,10 @@ foreach ($modules as $m) {
         // 실행: 실패할 가능성이 있는 컬럼들에 대해 사전에 기본값을 채워 넣음으로써 호환성을 확보합니다.
         $sql = "INSERT INTO g5_board (" . implode(',', $colNames) . ") VALUES (" . implode(',', $placeholders) . ")";
         $ins = $gn_db->prepare($sql);
-        $ins->execute($values);
-        echo "+ 보드 생성: {$bo_table} ({$title})\n";
+        run_stmt($ins, $values, "insert g5_board {$bo_table}");
+        log_msg("+ 보드 생성: {$bo_table} ({$title})\n");
     } else {
-        echo "- 보드 이미 존재: {$bo_table} ({$title})\n";
+        log_msg("- 보드 이미 존재: {$bo_table} ({$title})\n");
     }
 
     // 3) write 테이블 존재 확인 및 생성
@@ -282,14 +413,23 @@ foreach ($modules as $m) {
     // wr_content 컬럼이 작은 타입(varchar 등)이면 MEDIUMTEXT로 변경 시도
     ensure_column_is_mediumtext($gn_db, "g5_write_{$bo_table}", "wr_content");
 
-    // 4) 문서(게시글) 가져오기
+    // 4) 문서(게시글) 가져오기 (스트리밍 처리로 메모리 절감)
+    // 전체 문서 수를 먼저 카운트하여 진행 상황을 알립니다.
+    $cnt_stmt = $src_db->prepare("SELECT COUNT(*) FROM {$prefix}documents WHERE module_srl = ?");
+    $cnt_stmt->execute([$module_srl]);
+    $doc_total = (int)$cnt_stmt->fetchColumn();
+    log_msg("  -> 문서 수: {$doc_total} (streaming)\n");
+
     $docs_stmt = $src_db->prepare("SELECT * FROM {$prefix}documents WHERE module_srl = ? ORDER BY regdate ASC");
     $docs_stmt->execute([$module_srl]);
-    $docs = $docs_stmt->fetchAll(PDO::FETCH_ASSOC);
-    echo "  -> 문서 수: " . count($docs) . "\n";
 
-    foreach ($docs as $doc) {
-        if (isset($doc['status']) && strtoupper($doc['status']) === 'DELETED') continue;
+    $processed = 0;
+    while ($doc = $docs_stmt->fetch(PDO::FETCH_ASSOC)) {
+        $processed++;
+        if (isset($doc['status']) && strtoupper($doc['status']) === 'DELETED') {
+            unset($doc);
+            continue;
+        }
 
         $wr_num = get_next_wr_num($bo_table, $gn_db);
 
@@ -304,7 +444,7 @@ foreach ($modules as $m) {
         $mb_id = isset($doc['user_id']) ? $doc['user_id'] : '';
 
         try {
-            $ins->execute([
+            run_stmt($ins, [
                 $wr_num,
                 isset($doc['title']) ? $doc['title'] : '',
                 $content,
@@ -313,7 +453,7 @@ foreach ($modules as $m) {
                 isset($doc['regdate']) ? $doc['regdate'] : '',
                 isset($doc['ipaddress']) ? $doc['ipaddress'] : '',
                 $mb_id
-            ]);
+            ], "insert g5_write_{$bo_table}");
         } catch (PDOException $e) {
             $msg = $e->getMessage();
             if (strpos($msg, 'Data too long') !== false || $e->getCode() == '22001') {
@@ -322,10 +462,7 @@ foreach ($modules as $m) {
                 if ($max > 0 && mb_strlen($content) > $max) {
                     $trunc = mb_substr($content, 0, max(0, $max - 200));
                     $trunc .= "\n\n[...truncated... original_length=" . mb_strlen($content) . "]";
-                    $ins = $gn_db->prepare("INSERT INTO g5_write_{$bo_table} 
-            (wr_num, wr_reply, wr_parent, wr_is_comment, wr_comment, wr_subject, wr_content, wr_hit, wr_name, wr_datetime, wr_ip, mb_id)
-            VALUES (?, '', 0, 0, 0, ?, ?, ?, ?, ?, ?, ?)");
-                    $ins->execute([
+                    run_stmt($ins, [
                         $wr_num,
                         isset($doc['title']) ? $doc['title'] : '',
                         $trunc,
@@ -334,8 +471,9 @@ foreach ($modules as $m) {
                         isset($doc['regdate']) ? $doc['regdate'] : '',
                         isset($doc['ipaddress']) ? $doc['ipaddress'] : '',
                         $mb_id
-                    ]);
-                    echo "    ! 잘림: 문서 " . (isset($doc['document_srl']) ? $doc['document_srl'] : '(unknown)') . " (원본 길이=" . mb_strlen($content) . ")\n";
+                    ], "insert g5_write_{$bo_table} (truncated)");
+                    log_msg("    ! 잘림: 문서 " . (isset($doc['document_srl']) ? $doc['document_srl'] : '(unknown)') . " (원본 길이=" . mb_strlen($content) . ")\n");
+                    unset($trunc);
                 } else {
                     throw $e;
                 }
@@ -345,10 +483,16 @@ foreach ($modules as $m) {
         }
 
         $new_wr_id = $gn_db->lastInsertId();
-        $gn_db->exec("UPDATE g5_write_{$bo_table} SET wr_parent = '{$new_wr_id}' WHERE wr_id = '{$new_wr_id}'");
+        run_exec($gn_db, "UPDATE g5_write_{$bo_table} SET wr_parent = '{$new_wr_id}' WHERE wr_id = '{$new_wr_id}'", "update wr_parent {$new_wr_id}");
 
-        echo "    * 문서 " . (isset($doc['document_srl']) ? $doc['document_srl'] : '(unknown)') . " -> wr_id {$new_wr_id}\n";
+        log_msg("    * 문서 " . (isset($doc['document_srl']) ? $doc['document_srl'] : '(unknown)') . " -> wr_id {$new_wr_id}\n");
+
+        // 메모리 절약: 큰 변수와 참조 해제, 가비지 콜렉션 유도
+        unset($content, $doc);
+        if (function_exists('gc_collect_cycles')) gc_collect_cycles();
     }
+
+    log_msg("  -> 처리 완료: {$processed} / {$doc_total}\n");
 
     // 5) 메뉴 항목 추가 (간단 매핑)
     $menu_check = $gn_db->prepare("SELECT me_id FROM g5_menu WHERE me_code = ?");
@@ -356,15 +500,15 @@ foreach ($modules as $m) {
     if (!$menu_check->fetch()) {
         $menu_ins = $gn_db->prepare("INSERT INTO g5_menu (me_code, me_name, me_link, me_target, me_order, me_use) VALUES (?, ?, ?, ?, ?, ?)");
         $menu_link = './board.php?bo_table=' . $bo_table;
-        $menu_ins->execute([$bo_table, $title, $menu_link, '_self', $menu_order++, 1]);
-        echo "+ 메뉴 추가: {$title} -> {$menu_link}\n";
+        run_stmt($menu_ins, [$bo_table, $title, $menu_link, '_self', $menu_order++, 1], "insert g5_menu {$bo_table}");
+        log_msg("+ 메뉴 추가: {$title} -> {$menu_link}\n");
     }
 }
 
 // 회원 마이그레이션 (기본 필드만)
 $members = $src_db->query("SELECT * FROM {$prefix}member")->fetchAll(PDO::FETCH_ASSOC);
 if ($members) {
-    echo "회원 수: " . count($members) . " -> 마이그레이션 시작\n";
+    log_msg("회원 수: " . count($members) . " -> 마이그레이션 시작\n");
     foreach ($members as $m) {
         $mb_id = $m['user_id'];
         $check = $gn_db->prepare("SELECT mb_id FROM g5_member WHERE mb_id = ?");
@@ -376,7 +520,7 @@ if ($members) {
         $memo = "migrated_from_rhymix member_srl=" . (isset($m['member_srl']) ? $m['member_srl'] : '') . " original_pass_hash=" . $orig_pw;
 
         $ins = $gn_db->prepare("INSERT INTO g5_member (mb_id, mb_password, mb_name, mb_nick, mb_email, mb_homepage, mb_datetime, mb_ip, mb_memo) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
-        $ins->execute([
+        run_stmt($ins, [
             $mb_id,
             password_hash($rand_pass, PASSWORD_DEFAULT),
             isset($m['user_name']) ? $m['user_name'] : '',
@@ -386,11 +530,11 @@ if ($members) {
             isset($m['regdate']) ? $m['regdate'] : date('Y-m-d H:i:s'),
             isset($m['last_login']) ? $m['last_login'] : '',
             $memo
-        ]);
-        echo "+ 회원 생성: {$mb_id}\n";
+        ], "insert g5_member {$mb_id}");
+        log_msg("+ 회원 생성: {$mb_id}\n");
     }
 } else {
-    echo "원본 회원 테이블을 찾지 못했거나 회원이 없습니다. ({$prefix}member)\n";
+    log_msg("원본 회원 테이블을 찾지 못했거나 회원이 없습니다. ({$prefix}member)\n");
 }
 
 // 사이트 기본 설정(간단)
@@ -399,14 +543,14 @@ if ($site) {
     $title = isset($site['title']) ? $site['title'] : (isset($site['domain']) ? $site['domain'] : 'Migrated site');
     $chk = $gn_db->query("SELECT cf_id FROM g5_config LIMIT 1")->fetch(PDO::FETCH_ASSOC);
     if ($chk) {
-        $gn_db->exec("UPDATE g5_config SET cf_title = " . $gn_db->quote($title) . " LIMIT 1");
-        echo "+ 사이트 제목 업데이트: {$title}\n";
+        run_exec($gn_db, "UPDATE g5_config SET cf_title = " . $gn_db->quote($title) . " LIMIT 1", "update g5_config title");
+        log_msg("+ 사이트 제목 업데이트: {$title}\n");
     } else {
-        $gn_db->exec("INSERT INTO g5_config (cf_title) VALUES (" . $gn_db->quote($title) . ")");
-        echo "+ 사이트 제목 삽입: {$title}\n";
+        run_exec($gn_db, "INSERT INTO g5_config (cf_title) VALUES (" . $gn_db->quote($title) . ")", "insert g5_config title");
+        log_msg("+ 사이트 제목 삽입: {$title}\n");
     }
 }
 
-echo "=== 마이그레이션 완료 ===\n";
+log_msg("=== 마이그레이션 완료 ===\n");
 
 ?>

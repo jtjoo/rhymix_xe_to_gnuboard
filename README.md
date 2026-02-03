@@ -18,13 +18,20 @@
 
 1. **Backup both databases** (source and target) — DO NOT skip this. ⚠️
 2. Edit `config.php` and set correct DB connection values for `$src_config` and `$gn_config`.
-3. Run the migration script from the project root or migration directory:
+3. Run the migration script from the project root or migration directory. Use the `--dry-run` flag to preview actions without making changes, and `--log=FILE` to save a log.
 
 ```bash
+# Regular run (writes to target DB)
 php migrate2gb.php
+
+# Dry run (no writes, prints what would be done)
+php migrate2gb.php --dry-run
+
+# Dry run and write log to file
+php migrate2gb.php --dry-run --log=migration.log
 ```
 
-4. Check the console output for created boards, posts, members and any warnings.
+4. Check the console output (and optional log file) for created boards, posts, members and any warnings.
 
 ---
 
